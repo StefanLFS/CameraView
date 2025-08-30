@@ -232,7 +232,7 @@ public abstract class MediaEncoder {
     @SuppressWarnings("ConstantConditions")
     final void notify(final @NonNull String event, final @Nullable Object data) {
         if (!mPendingEvents.containsKey(event)) mPendingEvents.put(event,
-                 new AtomicInteger(0));
+                new AtomicInteger(0));
         final AtomicInteger pendingEvents = mPendingEvents.get(event);
         pendingEvents.incrementAndGet();
         LOG.v(mName, "Notify was called. Posting. pendingEvents:", pendingEvents.intValue());
@@ -406,7 +406,13 @@ public abstract class MediaEncoder {
             mBuffers = new MediaCodecBuffers(mMediaCodec);
         }
         while (true) {
-            int encoderStatus = mMediaCodec.dequeueOutputBuffer(mBufferInfo, OUTPUT_TIMEOUT_US);
+            int encoderStatus;
+            try {
+                encoderStatus = mMediaCodec.dequeueOutputBuffer(mBufferInfo, OUTPUT_TIMEOUT_US);
+            } catch (IllegalStateException e) {
+                LOG.w(mName, "drainOutput: codec not running - aborting.", e);
+                return;
+            }
             LOG.i(mName, "DRAINING - Got status:", encoderStatus);
             if (encoderStatus == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 // no output available yet

@@ -81,7 +81,24 @@ abstract class VideoMediaEncoder<C extends VideoConfig> extends MediaEncoder {
         }
         mMediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
         mSurface = mMediaCodec.createInputSurface();
-        mMediaCodec.start();
+        try {
+            mMediaCodec.start();
+        } catch (MediaCodec.CodecException e) {
+            LOG.w("start() failed; retrying with default encoder.", e);
+            try { mMediaCodec.release(); } catch (Exception ignore) {}
+            if (mConfig.encoder != null) {
+                 try {
+                        mMediaCodec = MediaCodec.createEncoderByType(mConfig.mimeType);
+                     } catch (java.io.IOException io) {
+                         throw new RuntimeException("Failed to create fallback MediaCodec", io);
+                     }
+                mMediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                mSurface = mMediaCodec.createInputSurface();
+                mMediaCodec.start();
+            } else {
+                throw e;
+            }
+        }
     }
 
     @EncoderThread

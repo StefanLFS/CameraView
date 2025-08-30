@@ -96,7 +96,12 @@ public class TextureMediaEncoder extends VideoMediaEncoder<TextureConfig> {
         mTransformRotation = mConfig.rotation;
         mConfig.rotation = 0;
         super.onPrepare(controller, maxLengthUs);
-        mEglCore = new EglCore(mConfig.eglContext, EglCore.FLAG_RECORDABLE);
+        try {
+            mEglCore = new EglCore(mConfig.eglContext, EglCore.FLAG_RECORDABLE);
+        } catch (RuntimeException e) {
+            LOG.w("EGL shared context failed; falling back to unshared.", e);
+            mEglCore = new EglCore(null, EglCore.FLAG_RECORDABLE);
+        }
         mWindow = new EglWindowSurface(mEglCore, mSurface, true);
         mWindow.makeCurrent();
         mDrawer = new GlTextureDrawer(mConfig.textureId);
