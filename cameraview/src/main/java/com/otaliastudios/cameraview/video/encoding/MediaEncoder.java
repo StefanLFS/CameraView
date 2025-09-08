@@ -556,7 +556,6 @@ public abstract class MediaEncoder {
             }
         }
     }
-
     /**
      * Should be called by subclasses to pass the milliseconds of the first frame - as soon
      * as this information is available. The milliseconds should be in the
