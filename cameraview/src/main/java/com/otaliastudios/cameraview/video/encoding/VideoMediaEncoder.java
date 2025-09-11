@@ -54,52 +54,118 @@ abstract class VideoMediaEncoder<C extends VideoConfig> extends MediaEncoder {
     @EncoderThread
     @Override
     protected void onPrepare(@NonNull MediaEncoderEngine.Controller controller, long maxLengthUs) {
-        MediaFormat format = MediaFormat.createVideoFormat(mConfig.mimeType, mConfig.width,
-                mConfig.height);
-
-        // Failing to specify some of these can cause the MediaCodec configure() call to throw an
-        // unhelpful exception. About COLOR_FormatSurface, see
-        // https://stackoverflow.com/q/28027858/4288782
-        // This just means it is an opaque, implementation-specific format that the device
-        // GPU prefers. So as long as we use the GPU to draw, the format will match what
-        // the encoder expects.
-        format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        format.setInteger(MediaFormat.KEY_BIT_RATE, mConfig.bitRate);
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, mConfig.frameRate);
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1); // seconds between key frames!
-        format.setInteger("rotation-degrees", mConfig.rotation);
-
+        MediaFormat format = MediaFormat.createVideoFormat(mConfig.mimeType, mConfig.width, mConfig.height);
         try {
-            if (mConfig.encoder != null) {
-                mMediaCodec = MediaCodec.createByCodecName(mConfig.encoder);
-            } else {
-                mMediaCodec = MediaCodec.createEncoderByType(mConfig.mimeType);
+            // Primary attempt: use your requested configuration as-is
+            format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+            format.setInteger(MediaFormat.KEY_BIT_RATE,   mConfig.bitRate);
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, mConfig.frameRate);
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+            format.setInteger("rotation-degrees", mConfig.rotation);
+
+            try {
+                if (mConfig.encoder != null) {
+                    mMediaCodec = MediaCodec.createByCodecName(mConfig.encoder);
+                } else {
+                    mMediaCodec = MediaCodec.createEncoderByType(mConfig.mimeType);
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
             }
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
-        mMediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-        mSurface = mMediaCodec.createInputSurface();
-        try {
-            mMediaCodec.start();
-        } catch (MediaCodec.CodecException e) {
-            LOG.w("start() failed; retrying with default encoder.", e);
-            try { mMediaCodec.release(); } catch (Exception ignore) {}
-            if (mConfig.encoder != null) {
-                 try {
+
+            mMediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            mSurface = mMediaCodec.createInputSurface();
+            try {
+                mMediaCodec.start();
+            } catch (MediaCodec.CodecException e) {
+                // If start fails with a named encoder, retry with default for same format
+                LOG.w("start() failed; retrying with default encoder.", e);
+                try { mMediaCodec.release(); } catch (Exception ignore) {}
+                if (mConfig.encoder != null) {
+                    try {
                         mMediaCodec = MediaCodec.createEncoderByType(mConfig.mimeType);
-                     } catch (java.io.IOException io) {
-                         throw new RuntimeException("Failed to create fallback MediaCodec", io);
-                     }
-                mMediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                    } catch (IOException io) {
+                        throw new RuntimeException("Failed to create fallback MediaCodec", io);
+                    }
+                    mMediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                    mSurface = mMediaCodec.createInputSurface();
+                    mMediaCodec.start();
+                } else {
+                    throw e;
+                }
+            }
+
+        } catch (Exception first) {
+            // --------- FALLBACK: find the lowest supported config from the actual device codec ---------
+            LOG.w("configure/start failed; falling back to lowest supported caps.", first);
+            try { if (mMediaCodec != null) mMediaCodec.release(); } catch (Exception ignore) {}
+            mMediaCodec = null;
+
+            try {
+                // Probe capabilities (no hardcoding)
+                MediaCodec probe = MediaCodec.createEncoderByType(mConfig.mimeType);
+                MediaCodecInfo info = probe.getCodecInfo();
+                MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(mConfig.mimeType);
+                MediaCodecInfo.VideoCapabilities vc = caps.getVideoCapabilities();
+
+                // Lowest supported width aligned
+                int widthAlign = vc.getWidthAlignment();
+                int minW = vc.getSupportedWidths().getLower();
+                if (widthAlign > 1) {
+                    int rem = minW % widthAlign;
+                    if (rem != 0) minW += (widthAlign - rem);
+                }
+
+                // Lowest supported height for that width, aligned
+                int heightAlign = vc.getHeightAlignment();
+                android.util.Range<Integer> hRange = vc.getSupportedHeightsFor(minW);
+                int minH = hRange.getLower();
+                if (heightAlign > 1) {
+                    int rem = minH % heightAlign;
+                    if (rem != 0) minH += (heightAlign - rem);
+                }
+
+                // Lowest supported fps for that size (at least 1)
+                double minFpsD = vc.getSupportedFrameRatesFor(minW, minH).getLower();
+                int minFps = Math.max(1, (int) Math.floor(minFpsD));
+
+                // ✅ Bitrate range comes from VideoCapabilities, not CodecCapabilities
+                android.util.Range<Integer> br = vc.getBitrateRange();
+                int minBitrate = clamp(br.getLower(), 100_000, Integer.MAX_VALUE); // guard with sane floor
+
+                try { probe.release(); } catch (Exception ignore) {}
+
+                // Build the fallback format
+                MediaFormat low = MediaFormat.createVideoFormat(mConfig.mimeType, minW, minH);
+                low.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+                low.setInteger(MediaFormat.KEY_FRAME_RATE,   minFps);
+                low.setInteger(MediaFormat.KEY_BIT_RATE,     minBitrate);
+                low.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+                low.setInteger("rotation-degrees", mConfig.rotation);
+
+                // Always use default encoder on fallback to maximize compatibility
+                try {
+                    mMediaCodec = MediaCodec.createEncoderByType(mConfig.mimeType);
+                } catch (IOException e) {
+                    throw new RuntimeException("Failed to create fallback MediaCodec", e);
+                }
+
+                mMediaCodec.configure(low, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                 mSurface = mMediaCodec.createInputSurface();
                 mMediaCodec.start();
-            } else {
-                throw e;
+
+                LOG.w("Fallback succeeded: " + minW + "x" + minH + " @" + minFps + "fps, bitrate=" + minBitrate);
+
+            } catch (Exception fail) {
+                LOG.e("Fallback to lowest supported caps failed.", fail);
+                throw (fail instanceof RuntimeException) ? (RuntimeException) fail : new RuntimeException(fail);
             }
         }
     }
+    private static int clamp(int v, int lo, int hi) {
+        return (v < lo) ? lo : (v > hi ? hi : v);
+    }
+
 
     @EncoderThread
     @Override
